@@ -1,0 +1,29 @@
+tasks:
+  # Simple tasks
+  - cmdline: "whoami"
+    expected: "localuser"
+
+  # Use expected to match only the fragment you care about
+  - cmdline: "dir C:\\Users\\kali\\test"
+    expected: Kharon.x64.exe
+
+  # Or use multiline to match the entire thing
+  - cmdline: "dir C:\\Users\\kali\\test"
+    expected: |
+        C:\Users\kali\test
+        Contents of C:\Users\kali\test\*:
+        	04/19/2026 16:59           <dir> .
+        	04/19/2026 16:59           <dir> ..
+        	04/16/2026 22:43           75776 Kharon.x64.exe
+        	                           75776 Total File Size for 1 File(s)
+        	                                                      2 Dir(s)
+
+  # ── Error handling ────────────────────────────────────────────────
+  # Unknown commands are rejected at dispatch (ok=false from server).
+  - cmdline: "xyzzy frobnicate"
+    expected: "will never succeed"
+    allowed_to_fail: true
+
+  # BOF with a nonexistent file is rejected at dispatch.
+  - cmdline: "bof /tmp/nonexistent.o"
+    allowed_to_fail: true

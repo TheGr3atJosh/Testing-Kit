@@ -1,0 +1,58 @@
+server:
+  url: https://127.0.0.1:4321
+  endpoint: /endpoint           # from profile.yaml → server.endpoint
+
+operator:
+  name: operator
+  password: changeme
+
+# Optional: pin to a specific agent ID.
+# Ignored when ssh: is configured. Omit to use the first available agent.
+# agent:
+#   id: 12abcdef
+
+# ── Setup ──────────────────────────────────────────────────────────────────────
+# Automatically create a listener and/or generate an agent before running tasks.
+# Two modes: profile-based (reads from ~/.adaptix/storage-v1.db) or inline.
+#
+# Profile-based:
+# setup:
+#   project: myproject                    # project name in the Adaptix DB
+#   listener_profile: my_listener         # name in ListenerProfiles  (omit → first in project)
+#   agent_profile: my_agent               # name in AgentProfiles      (omit → matches listener)
+#   agent_output: ./agent.exe             # where to save the payload  (default: ./generated_agent)
+#
+# Inline (no DB required — config fields mirror the Adaptix profile format):
+# setup:
+#   listener:
+#     name: my_listener
+#     type: KharonHTTP
+#     config:
+#       host_bind: "0.0.0.0"
+#       port_bind: 443
+#       callback_addresses:
+#         - "10.0.0.1:443"
+#   agent:
+#     agent: kharon
+#     listener: my_listener
+#     listener_type: KharonHTTP
+#     config:
+#       arch: x64
+#       format: Bin
+#       sleep: 5s
+#       jitter: 10
+#   agent_output: ./agent.bin
+#
+# Both can be mixed — e.g. listener from DB profile, agent inline.
+
+# ── SSH delivery ───────────────────────────────────────────────────────────────
+# Upload and start the agent via SSH before running tasks. Windows targets only.
+# Requires SSH authorized_keys configured on the target.
+# Tip: ssh-copy-id <username>@<host> to set that up.
+# ssh:
+#   host: 192.168.1.100                             # Required
+#   username: administrator                         # Required
+#   key_path: ~/.ssh/id_rsa                         # Optional: uses ssh-agent if omitted
+#   source_path: ./agent.exe                        # Optional: upload via SCP before starting
+#   agent_path: C:\Users\administrator\agent.exe    # Required: path to execute on target
+#   terminate: true                                 # Optional: kill agent and remove when done
