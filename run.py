@@ -271,36 +271,20 @@ def _exe_name(agent_path):
     return agent_path.replace("\\", "/").split("/")[-1]
 
 
-_WMIC_ERRORS = {
-    2: ("Access denied", "the SSH user lacks permission to create processes"),
-    3: ("Insufficient privilege", "try running as an elevated user"),
-    4: ("Initialization failure", "WMI service may not be running on the target"),
-    8: ("Unknown failure", "no additional detail from WMI"),
-    9: ("Path not found", "agent_path does not exist on the target — check config.yaml"),
-    10: ("Invalid parameter", "the path string contains unsupported characters"),
-    21: ("Invalid parameter", "malformed command line passed to WMI"),
-}
-
-
 def ssh_start_agent(client, agent_path):
-    _, stdout, stderr = client.exec_command(f'wmic process call create "{agent_path}"')
-    out = stdout.read().decode()
-    err = stderr.read().decode().strip()
-
-    if not out and not err:
-        die("Failed to start agent: no response from WMIC (is WMI available on the target?)")
-    if "ReturnValue = 0" in out:
-        return
-
-    m = re.search(r"ReturnValue = (\d+)", out)
-    if m:
-        code = int(m.group(1))
-        title, hint = _WMIC_ERRORS.get(code, ("Unknown error", f"WMIC return code {code}"))
-        die(f"Failed to start agent: {title} (code {code}) — {hint}")
-    elif err:
-        die(f"Failed to start agent: WMIC error — {err}")
-    else:
-        die("Failed to start agent: unexpected WMIC response (no ReturnValue found)")
+    # -NoNewWindow attaches the agent to this exec channel's ConPTY.
+    # The infinite sleep keeps the channel—and its ConPTY—alive until we
+    # close the SSH session after tasks complete.  -WindowStyle Hidden was tried
+    # first but fails silently on Windows Server 2022 SSH sessions (the process
+    # shows as exited within 2s despite the port being reachable).
+    cmd = (
+        f"powershell -Command \""
+        f"Start-Process -FilePath '{agent_path}' -NoNewWindow; "
+        f"while($true) {{ Start-Sleep -Seconds 60 }}"
+        f"\""
+    )
+    client.exec_command(cmd)
+    # Don't call recv_exit_status() — the loop holds the channel open intentionally.
 
 
 def ssh_terminate_agent(client, agent_path):
@@ -363,6 +347,13 @@ def ssh_deliver(base_url, headers, ssh_cfg):
     }
     ssh_start_agent(client, agent_path)
     console.print("[dim]Agent process started — waiting for check-in ...[/dim]")
+
+    time.sleep(2)
+    _, chk_out, _ = client.exec_command(
+        "powershell -Command \"if (Get-Process -Name agent -ErrorAction SilentlyContinue) { 'alive' } else { 'exited' }\""
+    )
+    status = chk_out.read().decode().strip()
+    console.print(f"[dim]Agent status (2s): {escape(status)}[/dim]")
 
     agent = wait_for_active_agent(base_url, headers, known_ticks)
     if agent is None:
