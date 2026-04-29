@@ -1,0 +1,20 @@
+# Add tasks here to test commands provided by your agent or any loaded Extension-Kit.
+# Each task runs against the live beacon. Fields:
+#   cmdline         — command sent to the agent (as typed in the Adaptix console)
+#   expected        — substring the output must contain (omit to just check it ran)
+#   allowed_to_fail — set true for expected-error cases (unknown cmd, bad args, etc.)
+tasks:
+  # Verify the agent is running as the CI user
+  - cmdline: "whoami"
+    expected: "ci_runner"
+
+  # Verify filesystem access — C:\ci is where the agent was dropped
+  - cmdline: "dir C:\\ci"
+    expected: "agent.exe"
+
+  # ── Error handling ─────────────────────────────────────────────────
+  # Unknown commands are rejected at dispatch (ok=false from server).
+  - cmdline: "xyzzy frobnicate"
+    expected: "will never succeed"
+    allowed_to_fail: true
+

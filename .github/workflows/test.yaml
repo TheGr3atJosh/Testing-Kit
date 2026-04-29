@@ -1,0 +1,273 @@
+name: Integration Tests
+
+# Runs entirely on a single GitHub-hosted windows-latest runner.
+# AdaptixC2 and adaptix-testing run inside WSL2 (Ubuntu).
+# The beacon runs on the Windows host.
+# SSH delivery goes from WSL → Windows via the Hyper-V bridge IP.
+# Beacon callbacks go from Windows → WSL via the WSL veth IP.
+# All IPs are detected at runtime — no static config needed.
+#
+# Hardcoded CI credentials are intentional: these containers are
+# ephemeral, hold no real secrets, and only exist for testing.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CI_USER: ci_runner
+  CI_PASS: Ci_Test_Pass1!
+  CI_AGENT_DIR: 'C:\ci'
+  CI_AGENT_PATH: 'C:\ci\agent.exe'
+
+jobs:
+  integration-test:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Pass CI variables into WSL
+        shell: powershell
+        run: echo "WSLENV=CI_USER/u:CI_PASS/u:CI_AGENT_PATH/u" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # ── Windows: CI user, OpenSSH, agent directory ──────────────────────────
+
+      - name: Create CI user
+        shell: powershell
+        run: |
+          $pass = ConvertTo-SecureString $env:CI_PASS -AsPlainText -Force
+          if (-not (Get-LocalUser $env:CI_USER -ErrorAction SilentlyContinue)) {
+            New-LocalUser $env:CI_USER -Password $pass -PasswordNeverExpires
+            Add-LocalGroupMember -Group Administrators -Member $env:CI_USER
+          } else {
+            Set-LocalUser $env:CI_USER -Password $pass
+          }
+
+      - name: Start OpenSSH Server with password auth
+        shell: powershell
+        run: |
+          $cap = Get-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+          if ($cap.State -ne 'Installed') {
+            Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+          }
+          Set-Service sshd -StartupType Automatic
+          Start-Service sshd
+          $cfg = "$env:ProgramData\ssh\sshd_config"
+          (Get-Content $cfg) `
+            -replace '^#?PasswordAuthentication\s+\w+', 'PasswordAuthentication yes' |
+            Set-Content $cfg
+          Restart-Service sshd
+
+      - name: Create agent drop directory
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:CI_AGENT_DIR | Out-Null
+          New-Item -ItemType Directory -Force -Path C:\tmp | Out-Null
+
+      - name: Disable Defender and open callback port
+        shell: powershell
+        run: |
+          Set-MpPreference -DisableRealtimeMonitoring $true
+          Add-MpPreference -ExclusionPath $env:CI_AGENT_DIR
+          New-NetFirewallRule -DisplayName "CI_C2_8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Any | Out-Null
+
+      # ── WSL: Ubuntu with required packages ──────────────────────────────────
+
+      - uses: Vampire/setup-wsl@v7
+        with:
+          distribution: Ubuntu-24.04
+          additional-packages: python3-pip openssl mingw-w64 make gcc g++ g++-mingw-w64
+
+      - name: Install Go 1.25.4
+        shell: wsl-bash {0}
+        run: |
+          wget -q https://go.dev/dl/go1.25.4.linux-amd64.tar.gz -O /tmp/go1.25.4.linux-amd64.tar.gz
+          sudo rm -rf /usr/local/go /usr/local/bin/go
+          sudo tar -C /usr/local -xzf /tmp/go1.25.4.linux-amd64.tar.gz
+          sudo ln -s /usr/local/go/bin/go /usr/local/bin/go
+
+      - name: Install uv
+        shell: wsl-bash {0}
+        run: pip3 install -q --break-system-packages uv
+
+      # ── WSL: clone, build, generate cert, write profile ─────────────────────
+
+      - name: Clone and build AdaptixC2
+        shell: wsl-bash {0}
+        run: |
+          git clone --depth 1 https://github.com/Adaptix-Framework/AdaptixC2 /tmp/adaptixc2
+          cd /tmp/adaptixc2
+          make server-ext
+
+      # ── Extension-Kit (and any additional kits) ─────────────────────────────
+      # To swap to a different kit: change the repo URL and update the axscripts
+      # entry in .github/ci/adaptixc2_profile.yaml to match.
+      # To add a second kit alongside this one: clone it, build it, then
+      # cp -r /tmp/<yourkit> /tmp/adaptixc2/dist/<YourKit> and add its .axs to
+      # the axscripts list in adaptixc2_profile.yaml.
+      # To run without any Extension-Kit: remove this step and remove the
+      # axscripts entry from adaptixc2_profile.yaml.
+      - name: Clone and build Extension-Kit
+        shell: wsl-bash {0}
+        run: |
+          git clone https://github.com/Adaptix-Framework/Extension-Kit /tmp/extensionkit
+          cd /tmp/extensionkit
+          git checkout dev
+          git fetch origin pull/139/head:pr-139
+          git merge --no-edit pr-139
+          git submodule update --init --recursive
+          sudo apt-get install -y -q \
+            gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix \
+            gcc-mingw-w64-i686 g++-mingw-w64-i686 \
+            mingw-w64-tools python3
+          make
+          cp -r /tmp/extensionkit /tmp/adaptixc2/dist/Extension-Kit
+
+      - name: Generate TLS certificate
+        shell: wsl-bash {0}
+        run: |
+          openssl req -x509 -nodes -newkey rsa:2048 \
+            -keyout /tmp/adaptixc2/dist/server.rsa.key \
+            -out /tmp/adaptixc2/dist/server.rsa.crt \
+            -days 1 -subj "/CN=ci"
+
+      - name: Write server profile
+        shell: wsl-bash {0}
+        run: |
+          WIN_WS=$(cmd.exe /c "echo %GITHUB_WORKSPACE%" 2>/dev/null | tr -d '\r')
+          cp "$(wslpath "$WIN_WS")/.github/ci/adaptixc2_profile.yaml" /tmp/adaptixc2/dist/profile.yaml
+
+      # ── WSL: install testing kit ─────────────────────────────────────────────
+
+      - name: Install adaptix-testing
+        shell: wsl-bash {0}
+        run: |
+          WIN_WS=$(cmd.exe /c "echo %GITHUB_WORKSPACE%" 2>/dev/null | tr -d '\r')
+          cp -r "$(wslpath "$WIN_WS")" /tmp/testing-kit
+          cd /tmp/testing-kit
+          uv sync
+
+      # ── WSL: SSH setup ───────────────────────────────────────────────────────
+
+      - name: Generate SSH keypair
+        shell: wsl-bash {0}
+        run: |
+          ssh-keygen -t ed25519 -N "" -f ~/.ssh/ci_key
+          cp ~/.ssh/ci_key.pub /mnt/c/tmp/ci_key.pub
+
+      - name: Install SSH public key on Windows
+        shell: powershell
+        run: |
+          $authFile = "$env:ProgramData\ssh\administrators_authorized_keys"
+          New-Item -Force -ItemType File -Path $authFile | Out-Null
+          Get-Content C:\tmp\ci_key.pub | Add-Content $authFile
+          icacls $authFile /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F"
+
+      # ── WSL: config + server + run ───────────────────────────────────────────
+      # Keep all wsl-bash steps below consecutive — a PowerShell step between them
+      # lets WSL2 idle-exit and kills the background server process.
+
+      - name: Write CI config
+        shell: wsl-bash {0}
+        run: |
+          WSL_IP=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' | head -1)
+          # WSL default gateway = the Windows IP reachable from inside WSL (correct for SSH).
+          # Parsing ipconfig from WSL picks the wrong vEthernet adapter when multiple exist.
+          WSL_GW=$(ip route show default 2>/dev/null | awk 'NR==1{print $3}')
+          WINDOWS_IP=$(cmd.exe /c ipconfig 2>/dev/null | tr -d '\r' | awk '/vEthernet.*WSL/{f=1} f && /IPv4 Address/{print $NF; exit}')
+          # Mirrored WSL2: either no vEthernet WSL adapter exists, OR WSL already owns
+          # that IP (shared address space). Use localhost for both cases.
+          if [ -z "$WINDOWS_IP" ] || ip addr show 2>/dev/null | grep -qF "$WINDOWS_IP"; then
+            CALLBACK_HOST="127.0.0.1"
+            SSH_HOST="127.0.0.1"
+            echo "=== WSL2 mirrored mode: WSL_IP=$WSL_IP WINDOWS_IP=${WINDOWS_IP:-none}, using localhost ==="
+          else
+            # NAT mode: Windows can reach WSL eth0 directly — use WSL_IP for beacon
+            # callbacks. SSH from WSL uses the default gateway (Windows side of WSL bridge).
+            CALLBACK_HOST="$WSL_IP"
+            SSH_HOST="${WSL_GW:-$WINDOWS_IP}"
+            echo "=== WSL2 NAT mode: WSL_IP=$WSL_IP WSL_GW=$WSL_GW WINDOWS_IP=$WINDOWS_IP, SSH→$SSH_HOST ==="
+          fi
+          cat > /tmp/ci_config.yaml << EOF
+          server:
+            url: https://127.0.0.1:4321
+            endpoint: /endpoint
+          operator:
+            name: ci
+            password: cipass
+          setup:
+            project: ci
+            agent_output: /tmp/ci_agent.exe
+            listener:
+              name: ci_http
+              type: BeaconHTTP
+              config:
+                host_bind: "0.0.0.0"
+                port_bind: 8080
+                callback_addresses:
+                  - "$CALLBACK_HOST:8080"
+                http_method: POST
+                uri:
+                  - /beacon
+                user_agent:
+                  - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                hb_header: "X-Beacon-Id"
+                encrypt_key: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+                ssl: false
+                page-payload: '{"status":"ok","data":"<<<PAYLOAD_DATA>>>","metrics":"sync"}'
+            # ── Agent ───────────────────────────────────────────────────────────
+            # To use a different agent (e.g. gopher): change agent/listener_type
+            # here, and change the listener type/config above to match.
+            # arch/format/sleep/jitter apply to beacon; other agents may differ.
+            agent:
+              agent: beacon
+              listener: ci_http
+              listener_type: BeaconHTTP
+              config:
+                arch: x64
+                format: Exe
+                sleep: "0s"
+                jitter: 0
+          ssh:
+            host: "$SSH_HOST"
+            username: "$CI_USER"
+            key_path: ~/.ssh/ci_key
+            source_path: /tmp/ci_agent.exe
+            agent_path: '$CI_AGENT_PATH'
+            terminate: true
+          EOF
+
+      - name: Start AdaptixC2 server
+        shell: wsl-bash {0}
+        run: |
+          cd /tmp/adaptixc2/dist
+          setsid ./adaptixserver -profile profile.yaml > /tmp/adaptixserver.log 2>&1 &
+          echo $! > /tmp/adaptixc2.pid
+          for i in $(seq 1 30); do
+            curl -sk https://127.0.0.1:4321/ -o /dev/null 2>/dev/null && break
+            sleep 1
+          done
+          curl -sk https://127.0.0.1:4321/ -o /dev/null || { echo "AdaptixC2 server did not start within 30s"; cat /tmp/adaptixserver.log; exit 1; }
+          echo "=== Server log at startup ==="
+          cat /tmp/adaptixserver.log
+
+      - name: Run integration tests
+        shell: wsl-bash {0}
+        run: |
+          cd /tmp/testing-kit
+          uv run adaptix-testing -c /tmp/ci_config.yaml -t .github/ci/tasks.yaml
+
+      # ── Cleanup ──────────────────────────────────────────────────────────────
+
+      - name: Stop AdaptixC2 server
+        if: always()
+        shell: wsl-bash {0}
+        run: |
+          [ -f /tmp/adaptixc2.pid ] && kill "$(cat /tmp/adaptixc2.pid)" 2>/dev/null || true
+
+      - name: Remove SSH key
+        if: always()
+        shell: wsl-bash {0}
+        run: rm -f ~/.ssh/ci_key ~/.ssh/ci_key.pub
