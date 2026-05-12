@@ -210,10 +210,10 @@ jobs:
               
               # Wait up to 30s for the C2 to boot up fully
               for i in $(seq 1 30); do
-                curl -sk https://127.0.0.1:4321/ -o /dev/null 2>/dev/null && break
+                wget --no-check-certificate -qO /dev/null https://127.0.0.1:4321/ && break
                 sleep 1
               done
-              curl -sk https://127.0.0.1:4321/ -o /dev/null || { 
+              wget --no-check-certificate -qO /dev/null https://127.0.0.1:4321/ || { 
                 echo "=== AdaptixC2 server failed to start within 30s ==="
                 cat /tmp/adaptixserver.log
                 exit 1
