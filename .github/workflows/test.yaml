@@ -27,7 +27,7 @@ jobs:
 
       - name: Pass CI variables into WSL
         shell: powershell
-        run: echo "WSLENV=CI_USER/u:CI_PASS/u:CI_AGENT_PATH/u" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        run: echo "WSLENV=CI_USER/u:CI_PASS/u:CI_AGENT_PATH/u:CI_CONTAINER/u" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       # ── Windows: CI user, OpenSSH, agent directory ──────────────────────────
 
