@@ -210,10 +210,10 @@ jobs:
               
               # Wait up to 30s for the C2 to boot up fully
               for i in $(seq 1 30); do
-                wget --no-check-certificate -qO /dev/null https://127.0.0.1:4321/ && break
+                python3 -c "import socket; socket.create_connection(('127.0.0.1', 4321), timeout=1)" 2>/dev/null && break
                 sleep 1
               done
-              wget --no-check-certificate -qO /dev/null https://127.0.0.1:4321/ || { 
+              python3 -c "import socket; socket.create_connection(('127.0.0.1', 4321), timeout=1)" 2>/dev/null || { 
                 echo "=== AdaptixC2 server failed to start within 30s ==="
                 cat /tmp/adaptixserver.log
                 exit 1
