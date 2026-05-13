@@ -1,14 +1,10 @@
 name: Integration Tests
 
-# Runs entirely on a single GitHub-hosted windows-latest runner.
-# AdaptixC2 and adaptix-testing run inside WSL2 (Ubuntu).
-# The beacon runs on the Windows host.
-# SSH delivery goes from WSL → Windows via the Hyper-V bridge IP.
-# Beacon callbacks go from Windows → WSL via the WSL veth IP.
-# All IPs are detected at runtime — no static config needed.
-#
-# Hardcoded CI credentials are intentional: these containers are
-# ephemeral, hold no real secrets, and only exist for testing.
+# Runs on a GitHub-hosted windows-latest runner.
+# WSL2 is initialized and runs Docker daemon natively.
+# The custom published Docker image runs with --network host passthrough.
+# SSH delivery goes from Docker(WSL) → Windows.
+# Beacon callbacks go from Windows → Docker(WSL).
 
 on:
   push:
@@ -20,6 +16,7 @@ env:
   CI_PASS: Ci_Test_Pass1!
   CI_AGENT_DIR: 'C:\ci'
   CI_AGENT_PATH: 'C:\ci\agent.exe'
+  CI_CONTAINER: 'ghcr.io/thegr3atjosh/adaptix-prebuilt:latest' 
 
 jobs:
   integration-test:
@@ -30,7 +27,7 @@ jobs:
 
       - name: Pass CI variables into WSL
         shell: powershell
-        run: echo "WSLENV=CI_USER/u:CI_PASS/u:CI_AGENT_PATH/u" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        run: echo "WSLENV=CI_USER/u:CI_PASS/u:CI_AGENT_PATH/u:CI_CONTAINER/u" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       # ── Windows: CI user, OpenSSH, agent directory ──────────────────────────
 
@@ -73,81 +70,33 @@ jobs:
           Add-MpPreference -ExclusionPath $env:CI_AGENT_DIR
           New-NetFirewallRule -DisplayName "CI_C2_8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Any | Out-Null
 
-      # ── WSL: Ubuntu with required packages ──────────────────────────────────
+      # ── WSL: Ubuntu + Docker ────────────────────────────────────────────────
 
       - uses: Vampire/setup-wsl@v7
         with:
           distribution: Ubuntu-24.04
-          additional-packages: python3-pip openssl mingw-w64 make gcc g++ g++-mingw-w64
+          # Install Docker inside WSL
+          additional-packages: docker.io iproute2 curl
 
-      - name: Install Go 1.25.4
+      - name: Start Docker daemon in WSL
         shell: wsl-bash {0}
         run: |
-          wget -q https://go.dev/dl/go1.25.4.linux-amd64.tar.gz -O /tmp/go1.25.4.linux-amd64.tar.gz
-          sudo rm -rf /usr/local/go /usr/local/bin/go
-          sudo tar -C /usr/local -xzf /tmp/go1.25.4.linux-amd64.tar.gz
-          sudo ln -s /usr/local/go/bin/go /usr/local/bin/go
-
-      - name: Install uv
-        shell: wsl-bash {0}
-        run: pip3 install -q --break-system-packages uv
-
-      # ── WSL: clone, build, generate cert, write profile ─────────────────────
-
-      - name: Clone and build AdaptixC2
-        shell: wsl-bash {0}
-        run: |
-          git clone --depth 1 https://github.com/Adaptix-Framework/AdaptixC2 /tmp/adaptixc2
-          cd /tmp/adaptixc2
-          make server-ext
-
-      # ── Extension-Kit (and any additional kits) ─────────────────────────────
-      # To swap to a different kit: change the repo URL and update the axscripts
-      # entry in .github/ci/adaptixc2_profile.yaml to match.
-      # To add a second kit alongside this one: clone it, build it, then
-      # cp -r /tmp/<yourkit> /tmp/adaptixc2/dist/<YourKit> and add its .axs to
-      # the axscripts list in adaptixc2_profile.yaml.
-      # To run without any Extension-Kit: remove this step and remove the
-      # axscripts entry from adaptixc2_profile.yaml.
-      - name: Clone and build Extension-Kit
-        shell: wsl-bash {0}
-        run: |
-          git clone https://github.com/Adaptix-Framework/Extension-Kit /tmp/extensionkit
-          cd /tmp/extensionkit
-          git checkout dev
-          git fetch origin pull/139/head:pr-139
-          git merge --no-edit pr-139
-          git submodule update --init --recursive
-          sudo apt-get install -y -q \
-            gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix \
-            gcc-mingw-w64-i686 g++-mingw-w64-i686 \
-            mingw-w64-tools python3
-          make
-          cp -r /tmp/extensionkit /tmp/adaptixc2/dist/Extension-Kit
-
-      - name: Generate TLS certificate
-        shell: wsl-bash {0}
-        run: |
-          openssl req -x509 -nodes -newkey rsa:2048 \
-            -keyout /tmp/adaptixc2/dist/server.rsa.key \
-            -out /tmp/adaptixc2/dist/server.rsa.crt \
-            -days 1 -subj "/CN=ci"
-
-      - name: Write server profile
-        shell: wsl-bash {0}
-        run: |
-          WIN_WS=$(cmd.exe /c "echo %GITHUB_WORKSPACE%" 2>/dev/null | tr -d '\r')
-          cp "$(wslpath "$WIN_WS")/.github/ci/adaptixc2_profile.yaml" /tmp/adaptixc2/dist/profile.yaml
-
-      # ── WSL: install testing kit ─────────────────────────────────────────────
-
-      - name: Install adaptix-testing
-        shell: wsl-bash {0}
-        run: |
-          WIN_WS=$(cmd.exe /c "echo %GITHUB_WORKSPACE%" 2>/dev/null | tr -d '\r')
-          cp -r "$(wslpath "$WIN_WS")" /tmp/testing-kit
-          cd /tmp/testing-kit
-          uv sync
+          # WSL compatibility for Docker
+          sudo update-alternatives --set iptables /usr/sbin/iptables-legacy || true
+          sudo update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy || true
+          
+          # Start dockerd in the background
+          sudo dockerd > /dev/null 2>&1 &
+          
+          echo "Waiting for Docker to start..."
+          for i in $(seq 1 30); do
+            if sudo docker info >/dev/null 2>&1; then
+              echo "Docker started successfully."
+              break
+            fi
+            sleep 1
+          done
+          sudo docker info >/dev/null 2>&1 || { echo "Docker failed to start"; exit 1; }
 
       # ── WSL: SSH setup ───────────────────────────────────────────────────────
 
@@ -165,38 +114,32 @@ jobs:
           Get-Content C:\tmp\ci_key.pub | Add-Content $authFile
           icacls $authFile /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F"
 
-      # ── WSL: config + server + run ───────────────────────────────────────────
-      # Keep all wsl-bash steps below consecutive — a PowerShell step between them
-      # lets WSL2 idle-exit and kills the background server process.
+      # ── WSL: config + Execution ──────────────────────────────────────────────
 
       - name: Write CI config
         shell: wsl-bash {0}
         run: |
           WSL_IP=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' | head -1)
-          # WSL default gateway = the Windows IP reachable from inside WSL (correct for SSH).
-          # Parsing ipconfig from WSL picks the wrong vEthernet adapter when multiple exist.
           WSL_GW=$(ip route show default 2>/dev/null | awk 'NR==1{print $3}')
           WINDOWS_IP=$(cmd.exe /c ipconfig 2>/dev/null | tr -d '\r' | awk '/vEthernet.*WSL/{f=1} f && /IPv4 Address/{print $NF; exit}')
-          # Mirrored WSL2: either no vEthernet WSL adapter exists, OR WSL already owns
-          # that IP (shared address space). Use localhost for both cases.
+          
           if [ -z "$WINDOWS_IP" ] || ip addr show 2>/dev/null | grep -qF "$WINDOWS_IP"; then
             CALLBACK_HOST="127.0.0.1"
             SSH_HOST="127.0.0.1"
             echo "=== WSL2 mirrored mode: WSL_IP=$WSL_IP WINDOWS_IP=${WINDOWS_IP:-none}, using localhost ==="
           else
-            # NAT mode: Windows can reach WSL eth0 directly — use WSL_IP for beacon
-            # callbacks. SSH from WSL uses the default gateway (Windows side of WSL bridge).
             CALLBACK_HOST="$WSL_IP"
             SSH_HOST="${WSL_GW:-$WINDOWS_IP}"
             echo "=== WSL2 NAT mode: WSL_IP=$WSL_IP WSL_GW=$WSL_GW WINDOWS_IP=$WINDOWS_IP, SSH→$SSH_HOST ==="
           fi
+          
           cat > /tmp/ci_config.yaml << EOF
           server:
             url: https://127.0.0.1:4321
             endpoint: /endpoint
           operator:
             name: ci
-            password: cipass
+            password: pass
           setup:
             project: ci
             agent_output: /tmp/ci_agent.exe
@@ -217,10 +160,6 @@ jobs:
                 encrypt_key: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
                 ssl: false
                 page-payload: '{"status":"ok","data":"<<<PAYLOAD_DATA>>>","metrics":"sync"}'
-            # ── Agent ───────────────────────────────────────────────────────────
-            # To use a different agent (e.g. gopher): change agent/listener_type
-            # here, and change the listener type/config above to match.
-            # arch/format/sleep/jitter apply to beacon; other agents may differ.
             agent:
               agent: beacon
               listener: ci_http
@@ -233,39 +172,63 @@ jobs:
           ssh:
             host: "$SSH_HOST"
             username: "$CI_USER"
-            key_path: ~/.ssh/ci_key
+            key_path: /root/.ssh/ci_key
             source_path: /tmp/ci_agent.exe
             agent_path: '$CI_AGENT_PATH'
             terminate: true
           EOF
 
-      - name: Start AdaptixC2 server
+      - name: Pull Adaptix Container
         shell: wsl-bash {0}
-        run: |
-          cd /tmp/adaptixc2/dist
-          setsid ./adaptixserver -profile profile.yaml > /tmp/adaptixserver.log 2>&1 &
-          echo $! > /tmp/adaptixc2.pid
-          for i in $(seq 1 30); do
-            curl -sk https://127.0.0.1:4321/ -o /dev/null 2>/dev/null && break
-            sleep 1
-          done
-          curl -sk https://127.0.0.1:4321/ -o /dev/null || { echo "AdaptixC2 server did not start within 30s"; cat /tmp/adaptixserver.log; exit 1; }
-          echo "=== Server log at startup ==="
-          cat /tmp/adaptixserver.log
+        run: sudo docker pull "$CI_CONTAINER"
 
-      - name: Run integration tests
+      - name: Run CI Container (Server + Tests)
         shell: wsl-bash {0}
         run: |
-          cd /tmp/testing-kit
-          uv run adaptix-testing -c /tmp/ci_config.yaml -t .github/ci/tasks.yaml
+          WIN_WS=$(cmd.exe /c "echo %GITHUB_WORKSPACE%" 2>/dev/null | tr -d '\r')
+          WSL_WS=$(wslpath "$WIN_WS")
+
+          sudo docker run --rm --network host \
+            -v "$WSL_WS:/workspace" \
+            -v ~/.ssh/ci_key:/root/.ssh/ci_key:ro \
+            -v /tmp/ci_config.yaml:/tmp/ci_config.yaml:ro \
+            "$CI_CONTAINER" \
+            bash -c '
+              # Ensure the globally installed testing-kit via `uv tool` is in PATH
+              export PATH="/root/.local/bin:$PATH"
+
+              echo "Generating required TLS certificate..."
+              openssl req -x509 -nodes -newkey rsa:2048 \
+                -keyout /tmp/adaptixc2/dist/server.rsa.key \
+                -out /tmp/adaptixc2/dist/server.rsa.crt \
+                -days 1 -subj "/CN=ci" 2>/dev/null
+              
+              echo "Starting AdaptixC2 Server..."
+              cd /tmp/adaptixc2/dist
+              ./adaptixserver -profile profile.yaml > /tmp/adaptixserver.log 2>&1 &
+              SERVER_PID=$!
+              
+              # Wait up to 60s for the C2 to boot up fully
+              for i in $(seq 1 60); do
+                (exec 3<>/dev/tcp/127.0.0.1/4321) 2>/dev/null && break
+                sleep 1
+              done
+              (exec 3<>/dev/tcp/127.0.0.1/4321) 2>/dev/null || {
+                echo "=== AdaptixC2 server failed to start within 30s ==="
+                cat /tmp/adaptixserver.log
+                exit 1
+              }
+              
+              echo "AdaptixC2 Ready! Running integration tests..."
+              adaptix-testing -c /tmp/ci_config.yaml -t /workspace/.github/ci/tasks.yaml
+              TEST_EXIT_CODE=$?
+              
+              echo "Tests Finished. Tearing down container."
+              kill $SERVER_PID 2>/dev/null
+              exit $TEST_EXIT_CODE
+            '
 
       # ── Cleanup ──────────────────────────────────────────────────────────────
-
-      - name: Stop AdaptixC2 server
-        if: always()
-        shell: wsl-bash {0}
-        run: |
-          [ -f /tmp/adaptixc2.pid ] && kill "$(cat /tmp/adaptixc2.pid)" 2>/dev/null || true
 
       - name: Remove SSH key
         if: always()
