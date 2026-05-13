@@ -21,6 +21,12 @@ adaptix-testing -c config.yaml -t tasks.yaml
 
 Both flags default to `config.yaml` / `tasks.yaml` in the current directory if omitted.
 
+Write results to a file instead of stdout (silent run):
+
+```sh
+adaptix-testing -c config.yaml -t tasks.yaml -o results.txt
+```
+
 ---
 
 ## config.yaml
@@ -117,6 +123,37 @@ ssh:
 When `terminate: true`, the agent process is killed via `taskkill` and its record removed from the server at the end of the run.
 
 Combine with `setup.agent_output` + `ssh.source_path` pointing to the same path to generate and immediately deliver an agent in one run.
+
+#### PowerShell preamble (optional)
+
+Run PowerShell commands on the target after connecting but before uploading and starting the agent. Use this to prepare the test environment — create directories, disable Defender, set environment variables, etc.
+
+```yaml
+ssh:
+  host: 192.168.1.100
+  username: administrator
+  source_path: ./agent.exe
+  agent_path: C:\ci\agent.exe
+  terminate: true
+  preamble:
+    - "New-Item -ItemType Directory -Force -Path C:\\ci"
+    - "Set-MpPreference -DisableRealtimeMonitoring $true"
+    - "Add-MpPreference -ExclusionPath C:\\ci"
+```
+
+Each command runs via PowerShell `-EncodedCommand` so quoting and special characters are handled safely. If any command exits with a non-zero code the run aborts immediately. A single string is also accepted instead of a list.
+
+---
+
+## --output flag
+
+Write results to a file instead of printing to stdout. Nothing is printed during the run; the file receives only the results section when complete.
+
+```sh
+adaptix-testing -c config.yaml -t tasks.yaml -o results.txt
+```
+
+On success the file contains just the summary table. On failure it also includes the failure detail panels. This is designed for CI pipelines where you want a clean artefact without interleaved progress output.
 
 ---
 

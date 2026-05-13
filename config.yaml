@@ -56,3 +56,6 @@ operator:
 #   source_path: ./agent.exe                        # Optional: upload via SCP before starting
 #   agent_path: C:\Users\administrator\agent.exe    # Required: path to execute on target
 #   terminate: true                                 # Optional: kill agent and remove when done
+#   preamble:                                       # Optional: PowerShell commands to run after
+#     - "New-Item -ItemType Directory -Force -Path C:\test"   # SSH connect, before agent starts.
+#     - "Set-MpPreference -DisableRealtimeMonitoring $true"   # Run as a list or a single string.
