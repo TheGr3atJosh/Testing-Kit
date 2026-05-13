@@ -208,12 +208,12 @@ jobs:
               ./adaptixserver -profile profile.yaml > /tmp/adaptixserver.log 2>&1 &
               SERVER_PID=$!
               
-              # Wait up to 30s for the C2 to boot up fully
-              for i in $(seq 1 30); do
-                python3 -c "import socket; socket.create_connection(('127.0.0.1', 4321), timeout=1)" 2>/dev/null && break
+              # Wait up to 60s for the C2 to boot up fully
+              for i in $(seq 1 60); do
+                (exec 3<>/dev/tcp/127.0.0.1/4321) 2>/dev/null && break
                 sleep 1
               done
-              python3 -c "import socket; socket.create_connection(('127.0.0.1', 4321), timeout=1)" 2>/dev/null || { 
+              (exec 3<>/dev/tcp/127.0.0.1/4321) 2>/dev/null || {
                 echo "=== AdaptixC2 server failed to start within 30s ==="
                 cat /tmp/adaptixserver.log
                 exit 1
