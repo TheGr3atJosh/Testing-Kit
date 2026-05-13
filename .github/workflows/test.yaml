@@ -195,6 +195,9 @@ jobs:
             bash -c '
               export PATH="/root/.local/bin:$PATH"
 
+              # Install current branch version over the container's baked-in copy
+              uv tool install --force /workspace
+
               # ── Feature validation (no server required) ──────────────────
               echo "=== Feature validation ==="
               adaptix-testing --help 2>&1 | grep -q -- "-o" && \
