@@ -139,7 +139,7 @@ jobs:
             endpoint: /endpoint
           operator:
             name: ci
-            password: cipass
+            password: pass
           setup:
             project: ci
             agent_output: /tmp/ci_agent.exe
