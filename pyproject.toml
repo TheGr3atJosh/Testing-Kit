@@ -18,9 +18,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 include = ["run.py"]
-
-[dependency-groups]
-dev = [
-    "pytest>=8.0",
-    "pytest-mock>=3.14",
-]
