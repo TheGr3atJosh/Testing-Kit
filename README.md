@@ -223,3 +223,9 @@ tasks:
 ```
 
 **CI integration** — exits `0` on all-pass, `1` on any failure, compatible with standard CI pipelines.
+
+---
+
+## CI/CD workflow supply chain note
+
+If you incorporate the CI/CD workflow from this repository into your own projects, it is strongly recommended to either pin all Docker images to specific versions or digests (e.g. `image@sha256:...`) rather than relying on mutable tags like `latest`, or to host your own copies of the images. The ideal long-term solution would be official Docker images published by the Adaptix Framework project itself.
