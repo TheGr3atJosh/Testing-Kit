@@ -193,10 +193,10 @@ jobs:
             -v /tmp/ci_config.yaml:/tmp/ci_config.yaml:ro \
             "$CI_CONTAINER" \
             bash -c '
-              # Use pre-baked venv Python to run workspace code directly.
-              # Avoids pip3/uv PATH issues in the pre-built image.
-              VENV_PY=/root/.local/share/uv/tools/adaptix-testing/.venv/bin/python
               export PATH="/usr/local/bin:/root/.local/bin:$PATH"
+              # Extract venv Python from the installed entry point's shebang —
+              # guaranteed correct regardless of Python version or tool name.
+              VENV_PY=$(sed -n '1s/^#!//p' /root/.local/bin/adaptix-testing)
 
               # ── Feature validation (no server required) ──────────────────
               echo "=== Feature validation ==="
