@@ -16,7 +16,7 @@ env:
   CI_PASS: Ci_Test_Pass1!
   CI_AGENT_DIR: 'C:\ci'
   CI_AGENT_PATH: 'C:\ci\agent.exe'
-  CI_CONTAINER: 'ghcr.io/thegr3atjosh/adaptix-prebuilt:latest' 
+  CI_CONTAINER: 'ghcr.io/thegr3atjosh/adaptix-prebuilt:latest'
 
 jobs:
   integration-test:
@@ -29,7 +29,10 @@ jobs:
         shell: powershell
         run: echo "WSLENV=CI_USER/u:CI_PASS/u:CI_AGENT_PATH/u:CI_CONTAINER/u" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # ── Windows: CI user, OpenSSH, agent directory ──────────────────────────
+      # ── Windows: CI user, OpenSSH, tmp directory ────────────────────────────
+      # C:\ci (agent drop dir) and Defender/firewall config are handled by the
+      # SSH preamble after connecting — these steps only do what must exist
+      # before SSH is available.
 
       - name: Create CI user
         shell: powershell
@@ -57,18 +60,9 @@ jobs:
             Set-Content $cfg
           Restart-Service sshd
 
-      - name: Create agent drop directory
+      - name: Create tmp directory for SSH key transfer
         shell: powershell
-        run: |
-          New-Item -ItemType Directory -Force -Path $env:CI_AGENT_DIR | Out-Null
-          New-Item -ItemType Directory -Force -Path C:\tmp | Out-Null
-
-      - name: Disable Defender and open callback port
-        shell: powershell
-        run: |
-          Set-MpPreference -DisableRealtimeMonitoring $true
-          Add-MpPreference -ExclusionPath $env:CI_AGENT_DIR
-          New-NetFirewallRule -DisplayName "CI_C2_8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Any | Out-Null
+        run: New-Item -ItemType Directory -Force -Path C:\tmp | Out-Null
 
       # ── WSL: Ubuntu + Docker ────────────────────────────────────────────────
 
@@ -84,10 +78,10 @@ jobs:
           # WSL compatibility for Docker
           sudo update-alternatives --set iptables /usr/sbin/iptables-legacy || true
           sudo update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy || true
-          
+
           # Start dockerd in the background
           sudo dockerd > /dev/null 2>&1 &
-          
+
           echo "Waiting for Docker to start..."
           for i in $(seq 1 30); do
             if sudo docker info >/dev/null 2>&1; then
@@ -122,7 +116,7 @@ jobs:
           WSL_IP=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' | head -1)
           WSL_GW=$(ip route show default 2>/dev/null | awk 'NR==1{print $3}')
           WINDOWS_IP=$(cmd.exe /c ipconfig 2>/dev/null | tr -d '\r' | awk '/vEthernet.*WSL/{f=1} f && /IPv4 Address/{print $NF; exit}')
-          
+
           if [ -z "$WINDOWS_IP" ] || ip addr show 2>/dev/null | grep -qF "$WINDOWS_IP"; then
             CALLBACK_HOST="127.0.0.1"
             SSH_HOST="127.0.0.1"
@@ -132,7 +126,7 @@ jobs:
             SSH_HOST="${WSL_GW:-$WINDOWS_IP}"
             echo "=== WSL2 NAT mode: WSL_IP=$WSL_IP WSL_GW=$WSL_GW WINDOWS_IP=$WINDOWS_IP, SSH→$SSH_HOST ==="
           fi
-          
+
           cat > /tmp/ci_config.yaml << EOF
           server:
             url: https://127.0.0.1:4321
@@ -176,6 +170,11 @@ jobs:
             source_path: /tmp/ci_agent.exe
             agent_path: '$CI_AGENT_PATH'
             terminate: true
+            preamble:
+              - 'New-Item -ItemType Directory -Force -Path C:\ci | Out-Null'
+              - 'Set-MpPreference -DisableRealtimeMonitoring \$true'
+              - 'Add-MpPreference -ExclusionPath C:\ci'
+              - 'New-NetFirewallRule -DisplayName CI_C2_8080 -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Any | Out-Null'
           EOF
 
       - name: Pull Adaptix Container
@@ -194,36 +193,55 @@ jobs:
             -v /tmp/ci_config.yaml:/tmp/ci_config.yaml:ro \
             "$CI_CONTAINER" \
             bash -c '
-              # Ensure the globally installed testing-kit via `uv tool` is in PATH
-              export PATH="/root/.local/bin:$PATH"
+              export PATH="/usr/local/bin:/root/.local/bin:$PATH"
+              uv tool install /workspace --reinstall
 
+              # ── Feature validation (no server required) ──────────────────
+              echo "=== Feature validation ==="
+              adaptix-testing --help 2>&1 | grep -q -- "-o" && \
+                echo "✓ --output flag available" || \
+                { echo "✗ --output flag missing from CLI"; exit 1; }
+              echo "=== Feature validation passed ==="
+
+              # ── Server startup ───────────────────────────────────────────
               echo "Generating required TLS certificate..."
               openssl req -x509 -nodes -newkey rsa:2048 \
                 -keyout /tmp/adaptixc2/dist/server.rsa.key \
                 -out /tmp/adaptixc2/dist/server.rsa.crt \
                 -days 1 -subj "/CN=ci" 2>/dev/null
-              
+
               echo "Starting AdaptixC2 Server..."
               cd /tmp/adaptixc2/dist
               ./adaptixserver -profile profile.yaml > /tmp/adaptixserver.log 2>&1 &
               SERVER_PID=$!
-              
+
               # Wait up to 60s for the C2 to boot up fully
               for i in $(seq 1 60); do
                 (exec 3<>/dev/tcp/127.0.0.1/4321) 2>/dev/null && break
                 sleep 1
               done
               (exec 3<>/dev/tcp/127.0.0.1/4321) 2>/dev/null || {
-                echo "=== AdaptixC2 server failed to start within 30s ==="
+                echo "=== AdaptixC2 server failed to start within 60s ==="
                 cat /tmp/adaptixserver.log
                 exit 1
               }
-              
+
+              # ── Integration tests (exercises --output and preamble) ──────
               echo "AdaptixC2 Ready! Running integration tests..."
-              adaptix-testing -c /tmp/ci_config.yaml -t /workspace/.github/ci/tasks.yaml
+              adaptix-testing -c /tmp/ci_config.yaml -t /workspace/.github/ci/tasks.yaml \
+                -o /tmp/ci-results.txt
               TEST_EXIT_CODE=$?
-              
-              echo "Tests Finished. Tearing down container."
+
+              echo "=== Test results ==="
+              cat /tmp/ci-results.txt
+
+              # Verify output file has a summary on success
+              if [ $TEST_EXIT_CODE -eq 0 ]; then
+                grep -q "All tasks passed" /tmp/ci-results.txt && \
+                  echo "✓ Output file contains expected summary" || \
+                  { echo "✗ Output file missing success summary"; exit 1; }
+              fi
+
               kill $SERVER_PID 2>/dev/null
               exit $TEST_EXIT_CODE
             '

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import io
 import json
 import os
 import re
@@ -25,10 +26,12 @@ POLL_INTERVAL = 2  # seconds between task list polls
 POLL_TIMEOUT = 60  # seconds before declaring a task timed-out
 
 console = Console(highlight=False)
+# Always write errors to stderr so they show even when console is silenced.
+_err_console = Console(stderr=True, highlight=False)
 
 
 def die(msg: str) -> None:
-    console.print(Panel(f"[bold]{escape(str(msg))}[/bold]", title="[bold red] Error [/bold red]", border_style="red"))
+    _err_console.print(Panel(f"[bold]{escape(str(msg))}[/bold]", title="[bold red] Error [/bold red]", border_style="red"))
     sys.exit(1)
 
 
@@ -271,6 +274,20 @@ def _exe_name(agent_path):
     return agent_path.replace("\\", "/").split("/")[-1]
 
 
+def _ps_run(client, cmd):
+    """Run a PowerShell command over SSH via -EncodedCommand. Returns (exit_code, stdout, stderr)."""
+    encoded = base64.b64encode(cmd.encode("utf-16-le")).decode()
+    _, out_ch, err_ch = client.exec_command(
+        f"powershell -NonInteractive -EncodedCommand {encoded}"
+    )
+    exit_code = out_ch.channel.recv_exit_status()
+    return (
+        exit_code,
+        out_ch.read().decode(errors="replace").strip(),
+        err_ch.read().decode(errors="replace").strip(),
+    )
+
+
 def ssh_start_agent(client, agent_path):
     # -NoNewWindow attaches the agent to this exec channel's ConPTY.
     # The infinite sleep keeps the channel—and its ConPTY—alive until we
@@ -326,6 +343,21 @@ def ssh_deliver(base_url, headers, ssh_cfg):
     console.print(f"[dim]SSH →[/dim] [cyan]{escape(host)}[/cyan]  [dim]{escape(agent_path)}[/dim]")
     client = ssh_connect(ssh_cfg)
     console.print("[green]✓[/green]  SSH connected")
+
+    preamble = ssh_cfg.get("preamble", [])
+    if isinstance(preamble, str):
+        preamble = [preamble]
+    for cmd in preamble:
+        console.print(f"  [dim]preamble →[/dim] [white]{escape(cmd)}[/white]")
+        exit_code, out, err = _ps_run(client, cmd)
+        if out:
+            for line in out.splitlines():
+                console.print(f"  [dim]{escape(line)}[/dim]")
+        if exit_code != 0:
+            client.close()
+            die(f"Preamble command failed (exit {exit_code}): {escape(err or 'no stderr')}")
+    if preamble:
+        console.print(f"[green]✓[/green]  Preamble done ({len(preamble)} command{'s' if len(preamble) != 1 else ''})")
 
     ssh_terminate_agent(client, agent_path)
     time.sleep(1)
@@ -417,6 +449,76 @@ def check_output(task_result, expected):
     return expected.lower() in actual.lower()
 
 
+# ── Results summary ───────────────────────────────────────────────────────────
+
+def _render_summary(c, results):
+    """Render the results summary table and any failure details to console c.
+    Returns 0 if all tasks passed, 1 otherwise."""
+    n_passed   = sum(1 for r in results if r["status"] == "passed")
+    n_failed   = sum(1 for r in results if r["status"] == "failed")
+    n_dispatch = sum(1 for r in results if r["status"] == "dispatch-failed")
+    n_timeout  = sum(1 for r in results if r["status"] == "timed-out")
+    n_xfail    = sum(1 for r in results if r["status"] == "xfail")
+    n_bad = n_failed + n_dispatch + n_timeout
+
+    c.print(Rule(style="dim"))
+
+    table = Table(box=None, show_header=False, padding=(0, 2), collapse_padding=True)
+    table.add_column(justify="right")
+    table.add_column()
+    table.add_row(f"[bold]{len(results)}[/bold]", "run")
+    table.add_row(f"[green]{n_passed}[/green]", "passed")
+    if n_failed:    table.add_row(f"[red]{n_failed}[/red]", "failed")
+    if n_dispatch:  table.add_row(f"[red]{n_dispatch}[/red]", "dispatch-failed")
+    if n_timeout:   table.add_row(f"[yellow]{n_timeout}[/yellow]", "timed out")
+    if n_xfail:     table.add_row(f"[yellow]{n_xfail}[/yellow]", "xfail")
+    c.print(table)
+
+    if n_bad == 0:
+        c.print("\n[bold green]All tasks passed.[/bold green]")
+        return 0
+
+    for r in [r for r in results if r["status"] == "failed"]:
+        res = r["result"] or {}
+        actual = res.get("a_text", "") + res.get("a_message", "")
+        exp = r["task"].get("expected", "")
+
+        body = Text()
+        body.append(r["task"]["cmdline"] + "\n\n", style="bold white")
+        body.append("Expected\n", style="dim")
+        body.append("─" * 48 + "\n", style="dim")
+        for line in exp.strip().splitlines():
+            body.append(line + "\n", style="yellow")
+        body.append(f"\nActual  ({len(actual):,} chars)\n", style="dim")
+        body.append("─" * 48 + "\n", style="dim")
+        for line in actual.splitlines():
+            body.append(line + "\n")
+        c.print(Panel(body, title="[bold red] FAILED [/bold red]", border_style="red"))
+
+    dispatched = [r for r in results if r["status"] == "dispatch-failed"]
+    if dispatched:
+        body = Text()
+        for r in dispatched:
+            body.append(r["task"]["cmdline"], style="white")
+            if r.get("err_msg"):
+                body.append(f"  {r['err_msg']}", style="dim")
+            body.append("\n")
+        c.print(Panel(body, title="[bold red] DISPATCH FAILED [/bold red]", border_style="red"))
+
+    timeouts = [r for r in results if r["status"] == "timed-out"]
+    if timeouts:
+        body = Text()
+        for r in timeouts:
+            body.append(r["task"]["cmdline"] + "\n", style="white")
+        c.print(Panel(
+            body,
+            title=f"[bold yellow] TIMED OUT [/bold yellow][dim] (>{POLL_TIMEOUT}s)[/dim]",
+            border_style="yellow",
+        ))
+
+    return 1
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -425,7 +527,14 @@ def main():
                         help="Path to config YAML (default: config.yaml)")
     parser.add_argument("-t", "-tasks", "--tasks", default="tasks.yaml",
                         help="Path to tasks YAML (default: tasks.yaml)")
+    parser.add_argument("-o", "--output", metavar="FILE", default=None,
+                        help="Write results to FILE; suppress all stdout during the run")
     args = parser.parse_args()
+
+    global console
+    output_path = args.output
+    if output_path:
+        console = Console(file=io.StringIO(), highlight=False)
 
     try:
         cfg = load_yaml(args.config)
@@ -462,9 +571,9 @@ def main():
             listener_profile = _resolve_listener_profile(setup_cfg, project)
             _create_listener_from_profile(base_url, headers, listener_profile)
 
-            output_path = setup_cfg.get("agent_output", "./generated_agent")
+            output_path_agent = setup_cfg.get("agent_output", "./generated_agent")
             agent_profile = _resolve_agent_profile(setup_cfg, project, listener_profile["name"])
-            _generate_agent_from_profile(base_url, headers, agent_profile, output_path)
+            _generate_agent_from_profile(base_url, headers, agent_profile, output_path_agent)
         except requests.exceptions.RequestException as e:
             die(f"Setup failed: {e}")
 
@@ -556,73 +665,12 @@ def main():
                 console.print("[green]✓[/green]  Agent terminated and removed")
             ssh_client.close()
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    n_passed   = sum(1 for r in results if r["status"] == "passed")
-    n_failed   = sum(1 for r in results if r["status"] == "failed")
-    n_dispatch = sum(1 for r in results if r["status"] == "dispatch-failed")
-    n_timeout  = sum(1 for r in results if r["status"] == "timed-out")
-    n_xfail    = sum(1 for r in results if r["status"] == "xfail")
-    n_bad = n_failed + n_dispatch + n_timeout
-
-    console.print(Rule(style="dim"))
-
-    table = Table(box=None, show_header=False, padding=(0, 2), collapse_padding=True)
-    table.add_column(justify="right")
-    table.add_column()
-    table.add_row(f"[bold]{len(results)}[/bold]", "run")
-    table.add_row(f"[green]{n_passed}[/green]", "passed")
-    if n_failed:    table.add_row(f"[red]{n_failed}[/red]", "failed")
-    if n_dispatch:  table.add_row(f"[red]{n_dispatch}[/red]", "dispatch-failed")
-    if n_timeout:   table.add_row(f"[yellow]{n_timeout}[/yellow]", "timed out")
-    if n_xfail:     table.add_row(f"[yellow]{n_xfail}[/yellow]", "xfail")
-    console.print(table)
-
-    if n_bad == 0:
-        console.print("\n[bold green]All tasks passed.[/bold green]")
-        return 0
-
-    # ── Failed detail ─────────────────────────────────────────────────────────
-    for r in [r for r in results if r["status"] == "failed"]:
-        res = r["result"] or {}
-        actual = res.get("a_text", "") + res.get("a_message", "")
-        exp = r["task"].get("expected", "")
-
-        body = Text()
-        body.append(r["task"]["cmdline"] + "\n\n", style="bold white")
-        body.append("Expected\n", style="dim")
-        body.append("─" * 48 + "\n", style="dim")
-        for line in exp.strip().splitlines():
-            body.append(line + "\n", style="yellow")
-        body.append(f"\nActual  ({len(actual):,} chars)\n", style="dim")
-        body.append("─" * 48 + "\n", style="dim")
-        for line in actual.splitlines():
-            body.append(line + "\n")
-        console.print(Panel(body, title="[bold red] FAILED [/bold red]", border_style="red"))
-
-    # ── Dispatch failures ─────────────────────────────────────────────────────
-    dispatched = [r for r in results if r["status"] == "dispatch-failed"]
-    if dispatched:
-        body = Text()
-        for r in dispatched:
-            body.append(r["task"]["cmdline"], style="white")
-            if r.get("err_msg"):
-                body.append(f"  {r['err_msg']}", style="dim")
-            body.append("\n")
-        console.print(Panel(body, title="[bold red] DISPATCH FAILED [/bold red]", border_style="red"))
-
-    # ── Timeouts ──────────────────────────────────────────────────────────────
-    timeouts = [r for r in results if r["status"] == "timed-out"]
-    if timeouts:
-        body = Text()
-        for r in timeouts:
-            body.append(r["task"]["cmdline"] + "\n", style="white")
-        console.print(Panel(
-            body,
-            title=f"[bold yellow] TIMED OUT [/bold yellow][dim] (>{POLL_TIMEOUT}s)[/dim]",
-            border_style="yellow",
-        ))
-
-    return 1
+    if output_path:
+        with open(output_path, "w") as f:
+            file_console = Console(file=f, highlight=False, no_color=True)
+            return _render_summary(file_console, results)
+    else:
+        return _render_summary(console, results)
 
 
 if __name__ == "__main__":
