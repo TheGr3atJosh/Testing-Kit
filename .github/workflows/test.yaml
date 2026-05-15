@@ -194,7 +194,7 @@ jobs:
             "$CI_CONTAINER" \
             bash -c '
               # Install current branch version over the container's pre-baked copy
-              uv tool install /workspace --editable
+              pip3 install --break-system-packages -e /workspace
               export PATH="/usr/local/bin:/root/.local/bin:$PATH"
 
               # ── Feature validation (no server required) ──────────────────
