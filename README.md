@@ -166,6 +166,12 @@ tasks:
   - cmdline: "fs ls C:\\Windows"
     expected: "explorer.exe"
 
+  - cmdline: "whoami"
+    expected_regex: "(?i)^.*user.*$"
+
+  - cmdline: "whoami"
+    not_expected: "access denied"
+
   - cmdline: "process kill 9999"
     allowed_to_fail: true
 ```
@@ -173,8 +179,13 @@ tasks:
 | Field | Description |
 |---|---|
 | `cmdline` | Command dispatched via `/agent/command/raw` (server-side AxScript engine) |
-| `expected` | Case-insensitive substring that must appear in output. Omit to only verify the command completed without error. |
+| `expected` | Case-insensitive substring that must appear in output. |
+| `expected_regex` | Regex that must match somewhere in the output. Case-sensitive; use `(?i)` prefix for case-insensitive. |
+| `not_expected` | Case-insensitive substring that must *not* appear in output. |
+| `not_expected_regex` | Regex that must *not* match anywhere in the output. |
 | `allowed_to_fail` | If `true`, failure / timeout / dispatch rejection counts as `xfail` and does not fail the run. |
+
+All four assertion fields are optional and combinable — every specified assertion must pass. Omit all of them to only verify the command completed without error.
 
 > **Note:** Only commands supported by the server-side AxScript engine work here. Client-side hook commands are not available. Some commands complete successfully but return no text output via the task list API (e.g. `fs pwd` on Kharon) — omit `expected` for those.
 
@@ -192,6 +203,9 @@ tasks:
     expected: "ntdll.dll"
   - cmdline: "process list"
     expected: "lsass.exe"
+    not_expected: "error"
+  - cmdline: "whoami"
+    expected_regex: "(?i)nt authority\\\\(system|network service)"
 ```
 
 **Full end-to-end run from zero** — spin up a listener, generate and deliver an agent, then run tasks, all in one command:

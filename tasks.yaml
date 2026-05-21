@@ -27,3 +27,21 @@ tasks:
   # BOF with a nonexistent file is rejected at dispatch.
   - cmdline: "bof /tmp/nonexistent.o"
     allowed_to_fail: true
+
+  # ── Regex and negative matching ───────────────────────────────────────
+  # Regex match — case-sensitive; use (?i) prefix for case-insensitive
+  # - cmdline: "whoami"
+  #   expected_regex: "(?i)^.*user.*$"
+
+  # Negative match — assert a substring is NOT in the output
+  # - cmdline: "whoami"
+  #   not_expected: "error"
+
+  # Negative regex — assert a pattern does NOT match
+  # - cmdline: "whoami"
+  #   not_expected_regex: "(?i)access.denied|permission.denied"
+
+  # Combined — all specified assertions must pass
+  # - cmdline: "whoami"
+  #   expected: "user"
+  #   not_expected_regex: "(?i)access.denied|error"

@@ -444,9 +444,17 @@ def poll_for_result(base_url, headers, agent_id, cmdline, known_ids):
     return merged
 
 
-def check_output(task_result, expected):
+def check_output(task_result, task):
     actual = task_result.get("a_text", "") + task_result.get("a_message", "")
-    return expected.lower() in actual.lower()
+    if (v := task.get("expected")) and v.lower() not in actual.lower():
+        return False
+    if (v := task.get("expected_regex")) and not re.search(v, actual):
+        return False
+    if (v := task.get("not_expected")) and v.lower() in actual.lower():
+        return False
+    if (v := task.get("not_expected_regex")) and re.search(v, actual):
+        return False
+    return True
 
 
 # ── Results summary ───────────────────────────────────────────────────────────
@@ -481,15 +489,26 @@ def _render_summary(c, results):
     for r in [r for r in results if r["status"] == "failed"]:
         res = r["result"] or {}
         actual = res.get("a_text", "") + res.get("a_message", "")
-        exp = r["task"].get("expected", "")
+        task = r["task"]
 
         body = Text()
-        body.append(r["task"]["cmdline"] + "\n\n", style="bold white")
-        body.append("Expected\n", style="dim")
-        body.append("─" * 48 + "\n", style="dim")
-        for line in exp.strip().splitlines():
-            body.append(line + "\n", style="yellow")
-        body.append(f"\nActual  ({len(actual):,} chars)\n", style="dim")
+        body.append(task["cmdline"] + "\n\n", style="bold white")
+
+        assertion_labels = [
+            ("expected",          "Expected         ", " (substring)"),
+            ("expected_regex",    "Expected regex   ", ""),
+            ("not_expected",      "Not expected     ", " (substring)"),
+            ("not_expected_regex","Not expected re  ", ""),
+        ]
+        for key, label, suffix in assertion_labels:
+            if v := task.get(key):
+                body.append(label + suffix + "\n", style="dim")
+                body.append("─" * 48 + "\n", style="dim")
+                for line in v.strip().splitlines():
+                    body.append(line + "\n", style="yellow")
+                body.append("\n")
+
+        body.append(f"Actual  ({len(actual):,} chars)\n", style="dim")
         body.append("─" * 48 + "\n", style="dim")
         for line in actual.splitlines():
             body.append(line + "\n")
@@ -643,7 +662,9 @@ def main():
             if result.get("a_msg_type") == 6:
                 passed = False
             else:
-                passed = check_output(result, expected) if expected else True
+                _assertion_keys = ("expected", "expected_regex", "not_expected", "not_expected_regex")
+                has_assertion = any(task.get(k) for k in _assertion_keys)
+                passed = check_output(result, task) if has_assertion else True
 
             if passed:
                 status, label = "passed", "[green]✓ PASS[/green]"
